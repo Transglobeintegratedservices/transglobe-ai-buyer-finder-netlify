@@ -1,9 +1,17 @@
 {
   "name": "transglobe-ai-buyer-finder",
-  "version": "2.0.0",
+  "version": "2.2.0",
   "private": true,
   "description": "Evidence-first online client discovery for Transglobe Integrated Services",
   "main": "server.js",
-  "scripts": { "start": "node server.js", "test": "node --test" },
-  "engines": { "node": ">=20" }
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@netlify/blobs": "^10.0.0"
+  }
 }
