@@ -1,14 +1,13 @@
 "use strict";
 
-// Netlify Functions adapter for Transglobe AI Buyer Finder.
-// Search keys are read only from Netlify's server-side environment.
+// Transglobe AI Buyer Finder V2
+// Netlify Functions adapter with persistent Netlify Blobs storage.
 
 const crypto = require("node:crypto");
+const { connectLambda, getStore } = require("@netlify/blobs");
 const core = require("../../server.js");
 
-let leads = [];
-let lastRun = null;
-let lastRunError = null;
+const STORE_NAME = "transglobe-ai-buyer-finder-v2";
 
 const SERVICE_LABELS = {
   topsoil: "Topsoil supply",
@@ -32,22 +31,43 @@ const reply = (statusCode, body) => ({
   body: JSON.stringify(body)
 });
 
-const parseBody = (event) => {
+function parseBody(event) {
   try {
     return event.body ? JSON.parse(event.body) : {};
   } catch {
     throw new Error("Invalid JSON body.");
   }
-};
+}
 
-const safeUrl = (raw) => {
+function safeUrl(raw) {
   try {
-    const u = new URL(raw);
-    return u.protocol === "https:" ? u.href : "";
+    const url = new URL(raw);
+    return url.protocol === "https:" ? url.href : "";
   } catch {
     return "";
   }
-};
+}
+
+function canonicalSource(raw) {
+  if (!raw) return "";
+
+  try {
+    return core.canonicalLink(raw);
+  } catch {
+    return "";
+  }
+}
+
+function sourceIndexKey(source) {
+  return `source-index/${crypto
+    .createHash("sha256")
+    .update(source)
+    .digest("hex")}.json`;
+}
+
+function leadKey(id) {
+  return `leads/${id}.json`;
+}
 
 function validate(input, prior = {}) {
   const x = { ...prior, ...input };
@@ -58,7 +78,10 @@ function validate(input, prior = {}) {
     throw new Error("Business / prospect name is required.");
   }
 
-  x.service = String(x.service || "Multiple services").slice(0, 100);
+  x.service = String(
+    x.service || "Multiple services"
+  ).slice(0, 100);
+
   x.location = String(x.location || "").slice(0, 150);
 
   if (
@@ -93,7 +116,10 @@ function validate(input, prior = {}) {
     x.priority = "Medium";
   }
 
-  x.score = Math.max(0, Math.min(100, Number(x.score) || 0));
+  x.score = Math.max(
+    0,
+    Math.min(100, Number(x.score) || 0)
+  );
 
   x.source = x.source ? safeUrl(x.source) : "";
 
@@ -101,7 +127,7 @@ function validate(input, prior = {}) {
     throw new Error("Source URL must use HTTPS.");
   }
 
-  for (const k of [
+  for (const key of [
     "email",
     "phone",
     "followup",
@@ -109,19 +135,59 @@ function validate(input, prior = {}) {
     "need",
     "sourceTitle"
   ]) {
-    x[k] = String(x[k] || "").slice(0, 1200);
+    x[key] = String(x[key] || "").slice(0, 5000);
   }
 
   return x;
 }
 
-async function discover(options = {}) {
-  if (
-    !process.env.LANGSEARCH_API_KEY &&
-    !process.env.SERPAPI_KEY
-  ) {
+// Read all prospects from persistent storage.
+// Each prospect is stored under its own key.
+async function listLeads(store) {
+  const results = [];
+
+  for await (const page of store.list({
+    prefix: "leads/",
+    paginate: true
+  })) {
+    for (const item of page.blobs || []) {
+      const lead = await store.get(item.key, {
+        type: "json",
+        consistency: "strong"
+      });
+
+      if (lead && lead.id) {
+        results.push(lead);
+      }
+    }
+  }
+
+  return results;
+}
+
+async function saveLead(store, lead) {
+  await store.setJSON(leadKey(lead.id), lead);
+}
+
+async function getRunStatus(store) {
+  return await store.get("meta/run-status.json", {
+    type: "json",
+    consistency: "strong"
+  }) || {
+    lastRun: null,
+    lastRunError: null
+  };
+}
+
+async function saveRunStatus(store, status) {
+  await store.setJSON("meta/run-status.json", status);
+}
+
+// Search the public web using the existing LangSearch integration.
+async function discover(store, options = {}) {
+  if (!process.env.LANGSEARCH_API_KEY) {
     throw new Error(
-      "Live search is not configured. Confirm LANGSEARCH_API_KEY is set for Netlify Functions, then redeploy."
+      "LangSearch is not configured. Confirm LANGSEARCH_API_KEY is set in Netlify environment variables, then redeploy."
     );
   }
 
@@ -129,33 +195,31 @@ async function discover(options = {}) {
     options.location || "Lagos, Nigeria"
   ).slice(0, 100);
 
-  const mode = ["both", "active", "potential"].includes(options.mode)
+  const mode = ["both", "active", "potential"].includes(
+    options.mode
+  )
     ? options.mode
     : "both";
 
-  const selected = Array.isArray(options.services)
-    ? options.services.filter((s) => services.includes(s))
+  const selectedServices = Array.isArray(options.services)
+    ? options.services.filter((service) =>
+        services.includes(service)
+      )
     : ["topsoil", "landscaping"];
 
   const queries = core.queriesFor({
     location,
     mode,
-    selectedServices: selected,
+    selectedServices,
     extraQuery: String(options.extraQuery || "").slice(0, 180)
   });
 
   const found = [];
   const failures = [];
 
-  // Nigerian locations used to verify geographic relevance.
   const nigeriaTerms =
     /\b(nigeria|nigerian|lagos|lekki|ajah|ikeja|ikorodu|badagry|epe|ogun|abeokuta|ibadan|abuja|port harcourt|enugu|benin city|warri|uyo|calabar|ilorin|kaduna|kano|jos|asaba|ondo|osun|oyo|kwara|anambra|delta state|rivers state|federal capital territory)\b/i;
 
-  // Overseas locations that may indicate irrelevant results.
-  const overseasTerms =
-    /\b(australia|australian|new zealand|united states|canada|united kingdom|england|scotland|wales|ireland|south africa|kenya|ghana|india|pakistan|bangladesh|singapore|malaysia|philippines)\b/i;
-
-  // Country-code domains commonly associated with other markets.
   const overseasDomains =
     /\.(com\.au|net\.au|org\.au|edu\.au|gov\.au|co\.uk|org\.uk|ac\.uk|nz|ca|za|ke|gh|in|pk|sg|my|ph)$/i;
 
@@ -163,130 +227,163 @@ async function discover(options = {}) {
     try {
       const results = await core.searchLangSearch(item.query);
 
-      for (const r of results) {
-        const text = `${r.title || ""} ${r.snippet || ""}`;
+      for (const result of results) {
+        const text =
+          `${result.title || ""} ${result.snippet || ""}`;
 
         let hostname = "";
 
         try {
-          hostname = new URL(r.link).hostname
+          hostname = new URL(result.link)
+            .hostname
             .toLowerCase()
             .replace(/^www\./, "");
         } catch {
           continue;
         }
 
-        if (!hostname) {
-          continue;
-        }
+        if (!hostname) continue;
 
         // Require Nigerian location evidence in the result text.
-        if (!nigeriaTerms.test(text)) {
-          continue;
-        }
+        if (!nigeriaTerms.test(text)) continue;
 
-        // Reject clearly overseas results when Nigerian evidence
-        // is absent. This is a safeguard, not proof of buyer intent.
-        if (
-          overseasTerms.test(text) &&
-          !nigeriaTerms.test(text)
-        ) {
-          continue;
-        }
+        // Exclude domains associated with other markets.
+        if (overseasDomains.test(hostname)) continue;
 
-        // Exclude country-code domains associated with other markets.
-        if (overseasDomains.test(hostname)) {
-          continue;
-        }
-
-        // Retain the existing service-relevance and intent classifier.
         const classification = core.classify(
-          r,
+          result,
           item.service,
           mode
         );
 
-        if (!classification) {
-          continue;
-        }
+        if (!classification) continue;
 
         found.push({
-          ...r,
+          ...result,
           ...classification,
           service: SERVICE_LABELS[item.service],
           query: item.query
         });
       }
-    } catch (e) {
+    } catch (error) {
       failures.push({
         query: item.query,
-        error: String(e.message || "Search failed")
+        error: String(error.message || "Search failed")
       });
     }
   }
 
-  // Avoid adding duplicate source links within the current function memory.
+  // Compare search results with existing persistent prospects.
+  const existing = await listLeads(store);
+
   const seen = new Set(
-    leads.map((x) => x.source).filter(Boolean)
+    existing
+      .map((lead) => canonicalSource(lead.source))
+      .filter(Boolean)
   );
 
   const added = [];
+  let duplicates = 0;
 
-  for (const r of found) {
-    const source = core.canonicalLink(r.link);
+  for (const result of found) {
+    const source = canonicalSource(result.link);
 
     if (!source || seen.has(source)) {
+      duplicates++;
       continue;
     }
 
-    seen.add(source);
+    const now = new Date().toISOString();
 
     const lead = {
       id: crypto.randomUUID(),
+
       name:
-        r.sourceName ||
+        result.sourceName ||
         new URL(source).hostname.replace(/^www\./, ""),
-      service: r.service,
+
+      service: result.service,
       location,
-      intent: r.intent,
-      priority: r.priority,
-      score: r.score,
+      intent: result.intent,
+      priority: result.priority,
+      score: result.score,
+
       status: "Verification pending",
+
       email: "",
       phone: "",
       followup: "",
+
       source,
-      sourceTitle: r.title,
-      need: r.snippet,
+      sourceTitle: result.title || "",
+      need: result.snippet || "",
+
       notes:
-        `Discovered via public web search. Query: ${r.query}` +
-        (r.date ? `; source date: ${r.date}` : ""),
-      sourceDate: r.date || "",
-      discoveredAt: new Date().toISOString(),
-      createdAt: new Date().toISOString(),
+        `Discovered via public web search. Query: ${result.query}` +
+        (result.date ? `; source date: ${result.date}` : ""),
+
+      sourceDate: result.date || "",
+      discoveredAt: now,
+      createdAt: now,
       archived: false
     };
 
+    // Save the prospect separately to avoid rewriting the entire list.
+    await saveLead(store, lead);
+
+    try {
+      // Atomically reserve the source URL against concurrent discoveries.
+      const reservation = await store.setJSON(
+        sourceIndexKey(source),
+        {
+          source,
+          leadId: lead.id,
+          createdAt: now
+        },
+        { onlyIfNew: true }
+      );
+
+      if (!reservation.modified) {
+        await store.delete(leadKey(lead.id));
+        seen.add(source);
+        duplicates++;
+        continue;
+      }
+    } catch (error) {
+      // Remove the newly written prospect if source registration fails.
+      try {
+        await store.delete(leadKey(lead.id));
+      } catch {
+        // Preserve the original storage error.
+      }
+
+      throw error;
+    }
+
+    seen.add(source);
     added.push(lead);
   }
 
-  leads = [...added, ...leads];
-
-  lastRun = {
+  const lastRun = {
     at: new Date().toISOString(),
     queriesRun: queries.length,
     results: found.length,
     newLeads: added.length,
-    duplicates: found.length - added.length,
+    duplicates,
     failures
   };
 
-  lastRunError =
-    failures.length === queries.length
+  const lastRunError =
+    queries.length > 0 && failures.length === queries.length
       ? failures[0]?.error || "All searches failed"
       : null;
 
-  if (queries.length && failures.length === queries.length) {
+  await saveRunStatus(store, {
+    lastRun,
+    lastRunError
+  });
+
+  if (queries.length > 0 && failures.length === queries.length) {
     throw new Error(
       `All ${queries.length} search queries failed. ${lastRunError}`
     );
@@ -299,35 +396,50 @@ async function discover(options = {}) {
 }
 
 exports.handler = async (event) => {
-  const path =
-    event.queryStringParameters?.path || "/api/health";
-
-  const method = event.httpMethod || "GET";
-
   try {
+    // Initialise the Netlify Blobs Lambda context.
+    connectLambda(event);
+
+    const store = getStore(STORE_NAME);
+
+    const path =
+      event.queryStringParameters?.path || "/api/health";
+
+    const method = event.httpMethod || "GET";
+
+    // Health check and storage readiness.
     if (method === "GET" && path === "/api/health") {
-      return reply(200, {
-        ok: true,
-        version: "2.1.0-netlify",
+      let storageReady = false;
+
+      try {
+        await store.list({ prefix: "leads/" });
+        storageReady = true;
+      } catch {
+        storageReady = false;
+      }
+
+      const status = storageReady
+        ? await getRunStatus(store)
+        : { lastRun: null, lastRunError: "Storage unavailable" };
+
+      return reply(storageReady ? 200 : 503, {
+        ok: storageReady,
+        version: "2.2.0-netlify",
         searchConfigured: Boolean(
-          process.env.LANGSEARCH_API_KEY ||
-          process.env.SERPAPI_KEY
+          process.env.LANGSEARCH_API_KEY
         ),
         searchProvider: process.env.LANGSEARCH_API_KEY
           ? "LangSearch"
-          : process.env.SERPAPI_KEY
-            ? "SerpApi (legacy)"
-            : "Not configured",
+          : "Not configured",
         langSearchConfigured: Boolean(
           process.env.LANGSEARCH_API_KEY
         ),
         aiConfigured: Boolean(process.env.OPENAI_API_KEY),
         schedulerRunning: false,
-        databaseReady: true,
-        storageMode:
-          "temporary function memory; use managed storage for durable leads",
-        lastRun,
-        lastRunError,
+        databaseReady: storageReady,
+        storageMode: "Netlify Blobs persistent storage",
+        lastRun: status.lastRun,
+        lastRunError: status.lastRunError,
         intervalHours: Number(
           process.env.SEARCH_INTERVAL_HOURS || 6
         ),
@@ -335,88 +447,126 @@ exports.handler = async (event) => {
       });
     }
 
+    // List active prospects.
     if (method === "GET" && path === "/api/leads") {
+      const leads = await listLeads(store);
+
       return reply(200, {
-        leads: leads.filter((x) => !x.archived)
+        leads: leads.filter((lead) => !lead.archived)
       });
     }
 
+    // Retrieve the most recent discovery status.
     if (method === "GET" && path === "/api/run-status") {
-      return reply(200, {
-        lastRun,
-        lastRunError
-      });
+      return reply(200, await getRunStatus(store));
     }
 
+    // Run live discovery.
     if (method === "POST" && path === "/api/discover") {
       try {
-        return reply(200, await discover(parseBody(event)));
-      } catch (e) {
-        lastRunError = e.message;
+        const result = await discover(store, parseBody(event));
+
+        return reply(200, result);
+      } catch (error) {
+        const previous = await getRunStatus(store).catch(() => ({
+          lastRun: null
+        }));
+
+        await saveRunStatus(store, {
+          lastRun: previous.lastRun || null,
+          lastRunError: String(
+            error.message || "Live discovery failed."
+          )
+        }).catch(() => {});
+
         return reply(503, {
-          error: e.message
+          error: String(
+            error.message || "Live discovery failed."
+          )
         });
       }
     }
 
+    // Create a prospect manually.
     if (method === "POST" && path === "/api/leads") {
-      const x = validate(parseBody(event));
+      const lead = validate(parseBody(event));
 
-      x.id = crypto.randomUUID();
-      x.createdAt = new Date().toISOString();
-      x.archived = false;
+      lead.id = crypto.randomUUID();
+      lead.createdAt = new Date().toISOString();
+      lead.updatedAt = lead.createdAt;
+      lead.archived = false;
 
-      leads.unshift(x);
+      await saveLead(store, lead);
 
-      return reply(201, {
-        lead: x
-      });
+      return reply(201, { lead });
     }
 
-    const match = path.match(/^\/api\/leads\/([a-f0-9-]+)$/i);
+    const match = path.match(
+      /^\/api\/leads\/([a-f0-9-]+)$/i
+    );
 
+    // Update an existing prospect.
     if (match && method === "PATCH") {
-      const i = leads.findIndex(
-        (x) => x.id === match[1] && !x.archived
+      const leads = await listLeads(store);
+
+      const existing = leads.find(
+        (lead) =>
+          lead.id === match[1] && !lead.archived
       );
 
-      if (i < 0) {
+      if (!existing) {
         return reply(404, {
           error: "Lead not found."
         });
       }
 
-      leads[i] = validate(parseBody(event), leads[i]);
+      const updated = validate(
+        parseBody(event),
+        existing
+      );
 
-      return reply(200, {
-        lead: leads[i]
-      });
+      updated.id = existing.id;
+      updated.createdAt = existing.createdAt;
+      updated.updatedAt = new Date().toISOString();
+      updated.archived = false;
+
+      await saveLead(store, updated);
+
+      return reply(200, { lead: updated });
     }
 
+    // Archive a prospect without permanently deleting it.
     if (match && method === "DELETE") {
-      const i = leads.findIndex(
-        (x) => x.id === match[1] && !x.archived
+      const leads = await listLeads(store);
+
+      const existing = leads.find(
+        (lead) =>
+          lead.id === match[1] && !lead.archived
       );
 
-      if (i < 0) {
+      if (!existing) {
         return reply(404, {
           error: "Lead not found."
         });
       }
 
-      leads[i].archived = true;
+      existing.archived = true;
+      existing.updatedAt = new Date().toISOString();
+      existing.archivedAt = existing.updatedAt;
 
-      return reply(200, {
-        ok: true
-      });
+      await saveLead(store, existing);
+
+      return reply(200, { ok: true });
     }
 
     return reply(404, {
       error: "API route not found."
     });
-  } catch (e) {
+  } catch (error) {
     return reply(500, {
-      error: String(e.message || "Internal server error.")
+      error: String(
+        error.message || "Internal server error."
+      )
     });
   }
 };
